@@ -2,6 +2,19 @@
 
 All notable user-facing and developer-facing changes to iris.
 
+## [0.1.0-sgidevnet.1] - 2026-07-30
+
+A fork build cut so `sgidevnet/irix-actions-runner` can depend on the snapshot
+restore fixes before they land upstream. Contents are upstream `main` plus
+`techomancer/iris#61`; there are no fork-only features. Everything in it is
+listed under Fixed in the section below.
+
+The headline is that `iris-ci restore` of a booted IRIX 6.5 guest now works.
+`impl From<L1DTag> for u32` packed the `dirty` flag into bit 27 of the L1 D-cache
+tag word, which is physical address bit 31, so every dirty line came back 2 GB
+from its own address and was never written back. Snapshots written before this
+build are migrated on load rather than misread.
+
 ## [Unreleased] — 2026-05-03
 
 The headline of this release is a complete snapshot/rollback stack: capture
