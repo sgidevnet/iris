@@ -158,6 +158,43 @@ compute the live chunk set.
 - **Z85c30 default constructor binds TCP** 8880/8881 on `new()`; tests
   use `new_null()` instead so two test instances don't race on the same
   ports. Also the right choice for CI mode (which already used it).
+- **Snapshot restore killed a booted IRIX 6.5 guest**: `impl From<L1DTag> for u32`
+  (`src/mips_cache_v2.rs:277`) packed `dirty` into bit 27 of the tag word, which
+  is `raw_ptag` bit 19 and therefore physical address bit 31. Every dirty L1
+  D-cache line deserialized `0x8000_0000` off its own address, never matched
+  again, and was never written back, so every store still in L1D at save time
+  silently reverted to the value in RAM. `dirty` now lives in bit 0, outside both
+  the ptag and `cs` fields. Restore survival went from 0 of 22 to 20 of 20 across
+  two independent guests, reproduced on a second harness at 7 of 7. The on-disk
+  `dc_tags` encoding changes, so `save_cache_state` writes a `dc_tag_format` key
+  and older snapshots are migrated on load rather than misread. See
+  `rules/snapshot/l1d-dirty-bit-aliased-physical-address-bit-31.md`.
+- **The memory controller charged the guest for time it spent stopped**:
+  `last_host_ticks` is a raw host tick count that nothing re-anchored, so the
+  first MC read after any pause credited `update_timers` with the whole interval
+  and stepped `RPSS_CTR` forward by billions of counts. Observed as a single step
+  of `cpu_cycles=16630691385` after a restore, which is 332 s at 50 MHz. Now
+  re-anchored in `MemoryController::start()`, which covers restore, the monitor
+  and the gdb stub.
+- **SCC restore left rr0 contradicting the emptied FIFOs**: `channel_from_toml`
+  cleared both queues but kept `status` verbatim. `RX_CHAR_AVAILABLE` restored
+  over an empty `rx_queue` has no reachable setter, since `read_data` returns 0
+  without touching the bit, so a guest polling RR0 spins on zeroes for good.
+  Measured at roughly 1 save in 10 when input is injected shortly beforehand,
+  which is the shape of any `iris-ci run` followed by `iris-ci save`.
+  `TX_BUFFER_EMPTY` restored clear deadlocks a guest that gates its write on the
+  bit, though `save_snapshot` cannot produce that state: the TX thread drains
+  the FIFO during the 3.7 to 8.4 ms between `cpu.stop()` and the SCC join.
+  Now sets `TX_BUFFER_EMPTY`, clears `RX_CHAR_AVAILABLE`, re-arms
+  `tx_int_pending` when WR1 has `TX_INT_EN` and WR5 has `TX_ENABLE`, and calls
+  `update_ip` so the SCC and the IOC's `map_stat` agree after `Ioc::load_state`
+  restores it wholesale. Independent of the L1D tag fix above: the post-restore
+  panic was byte-identical with and without this change. See
+  `rules/snapshot/scc-restore-rr0-contradicts-the-emptied-fifos.md`.
+- **CHD snapshots captured no disk state**, recorded but not fixed:
+  `cow_export` and `cow_import` match only `DiskBackend::Cow`, while `is_cow`
+  reports true for a `ChdHd` with a diff. RAM is restored while the disk stays
+  in the present. See `rules/snapshot/chd-snapshots-do-not-capture-the-disk.md`.
 
 ### Deprecated / Descoped
 

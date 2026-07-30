@@ -1070,11 +1070,35 @@ fn channel_from_toml(v: &toml::Value, ch: &mut Channel) {
     if let Some(r) = get_field(v, "regs")    { load_u8_slice(r, &mut ch.regs); }
     if let Some(x) = get_field(v, "reg_ptr") { if let Some(n) = toml_u8(x) { ch.reg_ptr = n; } }
     if let Some(x) = get_field(v, "status")  { if let Some(n) = toml_u8(x) { ch.status = n; } }
-    // Clear transient state — in-flight data and interrupt latches are lost on restore.
     ch.rx_queue.clear();
     ch.tx_queue.clear();
-    ch.tx_int_pending = false;
+    // Both FIFOs are empty now and rr0 has to agree. IRIX gates its write on
+    // TX_BUFFER_EMPTY, so a restored status without it deadlocks the driver
+    // against a device waiting to be written to. The model cannot rescue it:
+    // the TX thread only sets the bit after popping a character, and only while
+    // WR5 TX_ENABLE is set, so with the FIFO empty nothing ever sets it.
+    ch.status |= rr0::TX_BUFFER_EMPTY;
+    // RX has no such escape. read_data returns 0 without touching the bit when
+    // the queue is empty, so a guest polling a stale RX_CHAR_AVAILABLE spins
+    // on zeroes forever.
+    ch.status &= !rr0::RX_CHAR_AVAILABLE;
+    // Clearing tx_queue destroyed the character whose completion would have
+    // set the latch, and notify_tx_empty only fires when a transmit finishes,
+    // so nothing else ever would. WR5 is part of the gate because the TX
+    // thread's own predicate is (queue non-empty && TX_ENABLE): without it,
+    // restore would manufacture a latched interrupt on a disabled transmitter,
+    // a state the running model cannot reach.
+    let wr1 = ch.regs[scc_regs::WR1 as usize];
+    let wr5 = ch.regs[scc_regs::WR5 as usize];
+    ch.tx_int_pending =
+        (wr1 & wr1::TX_INT_EN) != 0 && (wr5 & wr5::TX_ENABLE) != 0;
     ch.update_tx_delay();
+    // power_on_devices cleared map_stat SERIAL and Ioc::load_state then put it
+    // back wholesale, so publish ip_num and redrive the line to keep the two
+    // agreeing. Safe under the channel lock: Ioc::read8 and write8 dispatch to
+    // the SCC before taking ioc::state, deliberately, so the reverse order does
+    // not exist.
+    ch.update_ip();
 }
 
 impl Saveable for Z85c30 {
@@ -1102,11 +1126,12 @@ impl Saveable for Z85c30 {
 // CiSerialBackend — in-process serial backend used by --ci mode.
 // ============================================================================
 
-/// Serial backend that the CI control socket reads from and writes to. The
-/// guest sees this as channel A (the IRIX console). Host pushes bytes into
-/// `host_to_guest` via `push_host`; the existing RX thread drains them into
-/// `channel_a.rx_queue`. Guest output reaches `send_byte`, which pushes into
-/// `guest_to_host` and wakes anyone waiting in `wait_for`.
+/// Serial backend that the CI control socket reads from and writes to.
+/// `Machine::new` installs it on channel B, which is tty1, the PROM and IRIX
+/// serial console. Host pushes bytes into `host_to_guest` via `push_host`; the
+/// existing RX thread drains them into `channel_b.rx_queue`. Guest output
+/// reaches `send_byte`, which pushes into `guest_to_host` and wakes anyone
+/// waiting in `wait_for`.
 pub struct CiSerialBackend {
     host_to_guest: Mutex<VecDeque<u8>>,
     guest_to_host: Mutex<Vec<u8>>,
@@ -1226,6 +1251,12 @@ mod tests {
     /// Phase 1.7 round-trip: a fresh SCC loaded from a captured save_state must
     /// re-serialize byte-identically. Use new_null so the test doesn't bind any
     /// TCP ports.
+    ///
+    /// The fixtures carry TX_BUFFER_EMPTY because restore is deliberately no
+    /// longer an identity on `status`: it forces that bit set and
+    /// RX_CHAR_AVAILABLE clear to match the emptied FIFOs. These values are
+    /// fixed points of that normalization. Do not "fix" the normalization to
+    /// make an arbitrary status round-trip.
     #[test]
     fn save_load_round_trip() {
         let src = Z85c30::new_null(None);
@@ -1236,7 +1267,7 @@ mod tests {
             ch.regs[3]  = 0xc1;
             ch.regs[5]  = 0xea;
             ch.reg_ptr  = 7;
-            ch.status   = 0x40;
+            ch.status   = 0x40 | rr0::TX_BUFFER_EMPTY;
         }
         {
             let mut ch = src.channel_b.0.lock();
@@ -1244,7 +1275,7 @@ mod tests {
             ch.regs[2]  = 0x10;
             ch.regs[15] = 0x05;
             ch.reg_ptr  = 3;
-            ch.status   = 0x80;
+            ch.status   = 0x80 | rr0::TX_BUFFER_EMPTY;
         }
         let v1 = src.save_state();
 
@@ -1308,5 +1339,173 @@ mod tests {
         assert_eq!(received.len(), line.len(),
             "expected {} bytes, got {} (lossy rx_queue?)", line.len(), received.len());
         assert_eq!(&received, line, "byte content mismatch — bytes dropped or reordered");
+    }
+
+    /// Restore clears `tx_queue`, which destroys the character whose
+    /// completion would have set the latch. Asserted through RR3, which is how
+    /// a guest ISR sees it: `read_a_control` recomputes channel A's IP live.
+    #[test]
+    fn restore_rearms_tx_interrupt() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+            ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
+        }
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+        dst.channel_a.0.lock().reg_ptr = 3;
+
+        assert_eq!(dst.read_a_control(), (1 << 1) << 3,
+            "RR3 must report a channel A TX interrupt after restore");
+    }
+
+    /// Guard on the re-arm above: a channel whose driver never enabled TX
+    /// interrupts must not come back from a restore asserting one. Passes on
+    /// the unfixed tree too, which forced the latch false unconditionally.
+    ///
+    /// Asserts the latch directly rather than through RR3. `get_ip` gates the TX
+    /// bit on WR1 independently, so RR3 cannot observe the latch while
+    /// `TX_INT_EN` is clear and an RR3 assertion here would hold even with the
+    /// WR1 conjunct deleted from `channel_from_toml`.
+    #[test]
+    fn restore_no_tx_int_when_disabled() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
+        }
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        let ch = dst.channel_a.0.lock();
+        assert!(!ch.tx_int_pending,
+            "latch must stay clear when WR1 TX_INT_EN is clear");
+        assert_eq!(ch.get_ip(), 0,
+            "no TX interrupt when WR1 TX_INT_EN is clear");
+    }
+
+    struct Recorder(AtomicBool);
+    impl IrqCallback for Recorder {
+        fn set_level(&self, level: bool) { self.0.store(level, Ordering::SeqCst); }
+    }
+
+    /// Channel B is the CI console (`machine.rs` installs `CiSerialBackend`
+    /// with `set_backend_b`), and it is not symmetric with A: `read_b_control`
+    /// returns 0 for RR3, so B's IP reaches the guest only through A's RR3 via
+    /// the shared `ip_other` atomic.
+    #[test]
+    fn restore_rearms_tx_interrupt_channel_b() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_b.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+            ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
+        }
+        let saved = src.save_state();
+
+        let irq = Arc::new(Recorder(AtomicBool::new(false)));
+        let dst = Z85c30::new_null(Some(irq.clone()));
+        dst.load_state(&saved).expect("load_state");
+        dst.channel_a.0.lock().reg_ptr = 3;
+
+        assert_eq!(dst.read_a_control(), 1 << 1,
+            "RR3 must report a channel B TX interrupt in its low bits");
+        assert!(irq.0.load(Ordering::SeqCst),
+            "restore must raise the IRQ line for channel B");
+    }
+
+    /// The TX thread only ever latches after a transmit it was allowed to make
+    /// (`!tx_queue.is_empty() && wr5 & TX_ENABLE`), so restoring a latch on a
+    /// disabled transmitter would synthesize a state the running model cannot
+    /// reach, holding the IOC line asserted until the guest issues `RES_Tx_P`.
+    #[test]
+    fn restore_no_tx_int_when_transmitter_disabled() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+            ch.regs[scc_regs::WR5 as usize] = 0;
+        }
+        let saved = src.save_state();
+
+        let irq = Arc::new(Recorder(AtomicBool::new(false)));
+        let dst = Z85c30::new_null(Some(irq.clone()));
+        dst.load_state(&saved).expect("load_state");
+        dst.channel_a.0.lock().reg_ptr = 3;
+
+        assert_eq!(dst.read_a_control(), 0,
+            "no TX interrupt when WR5 TX_ENABLE is clear");
+        assert!(!irq.0.load(Ordering::SeqCst),
+            "restore must not assert the IRQ line for a disabled transmitter");
+    }
+
+    /// The operative fix. A restored `status` without TX_BUFFER_EMPTY reads as
+    /// "still busy" to a guest polling RR0, and `write_data` only ever clears
+    /// that bit at a full FIFO, so the driver stops writing for good.
+    #[test]
+    fn restore_sets_tx_buffer_empty_status() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.status &= !rr0::TX_BUFFER_EMPTY;
+        }
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        let ch = dst.channel_a.0.lock();
+        assert!(ch.tx_queue.is_empty(), "tx_queue must be empty after restore");
+        assert!(ch.status & rr0::TX_BUFFER_EMPTY != 0,
+            "TX_BUFFER_EMPTY must be set when tx_queue is empty");
+    }
+
+    /// Setting the latch is not delivery. `get_ip` is a pure read of the
+    /// channel's own fields; the IRQ only reaches the IOC through `update_ip`,
+    /// which stores `ip_num` and calls `set_level`.
+    #[test]
+    fn restore_drives_irq_line_to_parent() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.regs[scc_regs::WR1 as usize] = wr1::TX_INT_EN;
+            ch.regs[scc_regs::WR5 as usize] = wr5::TX_ENABLE;
+        }
+        let saved = src.save_state();
+
+        let irq = Arc::new(Recorder(AtomicBool::new(false)));
+        let dst = Z85c30::new_null(Some(irq.clone()));
+        dst.load_state(&saved).expect("load_state");
+
+        assert_eq!(dst.channel_a.0.lock().ip_num.load(Ordering::SeqCst), 1 << 1,
+            "restore must publish the TX IP for the other channel to see");
+        assert!(irq.0.load(Ordering::SeqCst),
+            "restore must raise the IRQ line into the IOC");
+    }
+
+    /// A restored `status` claiming RX_CHAR_AVAILABLE over an empty `rx_queue`
+    /// never recovers: `read_data` only drops the bit when it pops a byte, so
+    /// the driver spins reading zeroes.
+    #[test]
+    fn restore_clears_rx_char_available_status() {
+        let src = Z85c30::new_null(None);
+        {
+            let mut ch = src.channel_a.0.lock();
+            ch.status |= rr0::RX_CHAR_AVAILABLE;
+        }
+        let saved = src.save_state();
+
+        let dst = Z85c30::new_null(None);
+        dst.load_state(&saved).expect("load_state");
+
+        let ch = dst.channel_a.0.lock();
+        assert!(ch.rx_queue.is_empty(), "rx_queue must be empty after restore");
+        assert!(ch.status & rr0::RX_CHAR_AVAILABLE == 0,
+            "RX_CHAR_AVAILABLE must be clear when rx_queue is empty");
     }
 }
