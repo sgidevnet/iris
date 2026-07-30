@@ -2,6 +2,21 @@
 
 All notable user-facing and developer-facing changes to iris.
 
+## [0.1.0-sgidevnet.2] - 2026-07-30
+
+Fork build so `sgidevnet/irix-actions-runner` can depend on the snapshot restore
+fixes before they land upstream. Upstream `main` plus `techomancer/iris` #63,
+#64, #65 and #66. No fork-only features.
+
+`iris-ci restore` of a booted IRIX 6.5 guest now works. The serialized L1D cache
+tag mixed two layouts from the R4400 manual, taking `PTag` from the TagLo
+register and the dirty bit from the physical cache line, so the dirty bit
+aliased physical address bit 31 and every dirty line came back 2 GB from its own
+address and was never written back.
+
+Supersedes `0.1.0-sgidevnet.1`, whose tag encoding was a dead end. Snapshots
+written by that build are refused rather than misread.
+
 ## [Unreleased] — 2026-05-03
 
 The headline of this release is a complete snapshot/rollback stack: capture
