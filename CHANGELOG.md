@@ -2,6 +2,17 @@
 
 All notable user-facing and developer-facing changes to iris.
 
+## [0.1.0-sgidevnet.3] - 2026-08-15
+
+Fork build for `sgidevnet/irix-actions-runner`, synchronized with upstream
+`main` through `cfd1728`. The snapshot restore fixes from the previous fork
+release and the long-running `iris-ci` timeout fix have all landed upstream,
+so this release contains no fork-only source changes.
+
+This incorporates the upstream CPU, JIT, device, dependency, NFS and GUI work
+since `0.1.0-sgidevnet.2`. The runner worker keeps the established
+`chd,lightning,rex-jit` feature set.
+
 ## [Unreleased] — 2026-05-03
 
 The headline of this release is a complete snapshot/rollback stack: capture

@@ -3,7 +3,7 @@ members = ["iris-gui"]
 
 [package]
 name = "iris"
-version = "0.1.0"
+version = "0.1.0-sgidevnet.3"
 edition = "2021"
 default-run = "iris"
 
@@ -247,6 +247,5 @@ required-features = ["jitv2"]
 # is dead-stripped. See rules/macos/appstore-private-api.md.
 [patch.crates-io]
 winit = { path = "third_party/winit-0.30.13" }
-
 
 
